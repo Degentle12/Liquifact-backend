@@ -70,23 +70,6 @@ function errorCodeFor(err) {
 }
 
 /**
- * Detects the "contract does not exist" rejection raised by the SDK when the
- * requested ledger entry is missing.
- *
- * @param {unknown} err error thrown by the RPC client
- * @returns {boolean} true when the entry is missing
- */
-function isNotFound(err) {
-  if (!err) {
-    return false;
-  }
-  if (err.code === 404 || err.status === 404 || err.statusCode === 404) {
-    return true;
-  }
-  return typeof err.message === 'string' && /not found/i.test(err.message);
-}
-
-/**
  * Normalises a ledger close time to whole unix seconds. RPC builds report it
  * as a string of seconds; millisecond values are accepted as well.
  *
@@ -225,7 +208,32 @@ async function checkLedger(server, timeoutMs, maxAgeSeconds, now) {
 }
 
 /**
+ * Builds the ledger key of a contract instance (its persistent instance
+ * entry), the entry `getContractData` looks up.
+ *
+ * @param {string} contractId escrow contract id
+ * @returns {object} the contract instance ledger key
+ */
+function contractInstanceKey(contractId) {
+  const { xdr, Contract } = require('@stellar/stellar-sdk');
+  return xdr.LedgerKey.contractData(
+    new xdr.LedgerKeyContractData({
+      key: xdr.ScVal.scvLedgerKeyContractInstance(),
+      contract: new Contract(contractId).address().toScAddress(),
+      durability: xdr.ContractDataDurability.persistent(),
+    }),
+  );
+}
+
+/**
  * Checks that the configured escrow contract is deployed on the RPC network.
+ *
+ * The instance entry is read with `getLedgerEntries` rather than
+ * `getContractData`: the SDK maps *every* failure of the latter (a transport
+ * error included) to a "contract data not found" error, which would make the
+ * probe blame the contract whenever the RPC is simply unreachable.
+ * `getLedgerEntries` answers with an empty entry list when the contract does
+ * not exist and rejects when the call itself fails.
  *
  * @param {object} server RPC client
  * @param {number} timeoutMs per-check timeout
@@ -234,15 +242,17 @@ async function checkLedger(server, timeoutMs, maxAgeSeconds, now) {
  */
 async function checkContract(server, timeoutMs, contractId) {
   try {
-    const { xdr, rpc } = require('@stellar/stellar-sdk');
-    const instanceKey = xdr.ScVal.scvLedgerKeyContractInstance();
-    await withTimeout(
-      server.getContractData(contractId, instanceKey, rpc.Durability.Persistent),
+    const result = await withTimeout(
+      server.getLedgerEntries(contractInstanceKey(contractId)),
       timeoutMs,
     );
+    const entries = result && Array.isArray(result.entries) ? result.entries : [];
+    if (entries.length === 0) {
+      return { ok: false, error: ERROR_CODES.CONTRACT_NOT_FOUND };
+    }
     return { ok: true };
   } catch (err) {
-    return { ok: false, error: isNotFound(err) ? ERROR_CODES.CONTRACT_NOT_FOUND : errorCodeFor(err) };
+    return { ok: false, error: errorCodeFor(err) };
   }
 }
 

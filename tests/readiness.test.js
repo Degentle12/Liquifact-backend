@@ -10,7 +10,7 @@
 process.env.READY_CHECK_TIMEOUT_MS = '50';
 
 const request = require('supertest');
-const { rpc } = require('@stellar/stellar-sdk');
+const { Contract } = require('@stellar/stellar-sdk');
 const app = require('../src/app');
 const config = require('../src/config');
 const { setRpcServer, resetRpcServer } = require('../src/stellar/rpc');
@@ -34,7 +34,7 @@ function fakeRpcServer(overrides = {}) {
     })),
     getNetwork: jest.fn(async () => ({ passphrase: PASSPHRASE, protocolVersion: 29 })),
     getLatestLedger: jest.fn(async () => ({ id: 'ledger-hash', sequence: 1000, closeTime: nowSeconds() })),
-    getContractData: jest.fn(async () => ({ key: {}, val: {} })),
+    getLedgerEntries: jest.fn(async () => ({ entries: [{ key: {}, val: {} }], latestLedger: 1000 })),
     ...overrides,
   };
 }
@@ -79,11 +79,14 @@ describe('GET /ready — healthy', () => {
 
   test('checks the configured contract instance key', async () => {
     await request(app).get('/ready');
-    expect(server.getContractData).toHaveBeenCalledTimes(1);
-    const [contractId, key, durability] = server.getContractData.mock.calls[0];
-    expect(contractId).toBe(config.contractId);
-    expect(key.switch().name).toBe('scvLedgerKeyContractInstance');
-    expect(durability).toBe(rpc.Durability.Persistent);
+    expect(server.getLedgerEntries).toHaveBeenCalledTimes(1);
+    const [ledgerKey] = server.getLedgerEntries.mock.calls[0];
+    const contractData = ledgerKey.contractData();
+    expect(contractData.key().switch().name).toBe('scvLedgerKeyContractInstance');
+    expect(contractData.durability().name).toBe('persistent');
+    expect(contractData.contract().toString()).toBe(
+      new Contract(config.contractId).address().toScAddress().toString(),
+    );
   });
 
   test('uses the injected RPC client instead of the network', async () => {
@@ -92,7 +95,7 @@ describe('GET /ready — healthy', () => {
     expect(server.getHealth).toHaveBeenCalled();
     expect(server.getNetwork).toHaveBeenCalled();
     expect(server.getLatestLedger).toHaveBeenCalled();
-    expect(server.getContractData).toHaveBeenCalled();
+    expect(server.getLedgerEntries).toHaveBeenCalled();
   });
 });
 
@@ -141,16 +144,26 @@ describe('GET /ready — failures', () => {
   });
 
   test('reports a missing contract with 503 and CONTRACT_NOT_FOUND', async () => {
-    install({
-      getContractData: jest.fn(async () => {
-        throw { code: 404, message: 'Contract data not found for CABC...' };
-      }),
-    });
+    install({ getLedgerEntries: jest.fn(async () => ({ entries: [], latestLedger: 1000 })) });
     const res = await request(app).get('/ready');
     expect(res.status).toBe(503);
     expect(res.body.status).toBe('not_ready');
     expect(res.body.checks.contract.ok).toBe(false);
     expect(res.body.checks.contract.error).toBe('CONTRACT_NOT_FOUND');
+  });
+
+  test('reports an unreachable RPC as RPC_ERROR, not as a missing contract', async () => {
+    install({
+      getLedgerEntries: jest.fn(async () => {
+        throw Object.assign(new Error('connect ECONNREFUSED 10.0.0.5:443'), { code: 'ECONNREFUSED' });
+      }),
+    });
+    const res = await request(app).get('/ready');
+    expect(res.status).toBe(503);
+    expect(res.body.checks.contract.ok).toBe(false);
+    expect(res.body.checks.contract.error).toBe('RPC_ERROR');
+    // The RPC itself answered, so the health check is unaffected.
+    expect(res.body.checks.rpc.ok).toBe(true);
   });
 
   test('never leaks raw upstream error messages', async () => {
@@ -201,7 +214,7 @@ describe('GET /health — liveness', () => {
     expect(server.getHealth).not.toHaveBeenCalled();
     expect(server.getNetwork).not.toHaveBeenCalled();
     expect(server.getLatestLedger).not.toHaveBeenCalled();
-    expect(server.getContractData).not.toHaveBeenCalled();
+    expect(server.getLedgerEntries).not.toHaveBeenCalled();
   });
 
   test('stays 200 while /ready reports a passphrase mismatch', async () => {
